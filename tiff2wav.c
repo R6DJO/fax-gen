@@ -231,6 +231,15 @@ static int write_wav(const char *path, const short *samples, long nsamples)
 
 /* ----- Main processing pipeline ----- */
 
+/* Sample offset where FAX line k begins. Rounding the boundary - instead of
+ * truncating every line to an integer length - keeps consecutive lines exactly
+ * contiguous, so a fractional samples-per-line (e.g. -l 110) leaves no zero
+ * gaps at the end of a line. */
+static long line_offset(double samples_per_line, long k)
+{
+    return (long)((double)k * samples_per_line + 0.5);
+}
+
 static int process(const char *input_path, const char *output_path)
 {
     /* Load TIFF image */
@@ -240,9 +249,7 @@ static int process(const char *input_path, const char *output_path)
     printf("Image: %d columns x %d rows\n", img.width, img.height);
 
     int sample_rate = p.sample_rate;
-    double lpm_val = (double)p.lpm;
-    double line_samples_d = 60.0 * sample_rate / lpm_val; /* samples per image row */
-    long line_samples = (long)line_samples_d;              /* truncate to integer */
+    double spl = 60.0 * (double)sample_rate / (double)p.lpm; /* samples per image row */
 
     int phasing_lines = p.phasing_lines;
     double carrier_freq = p.carrier_freq;
@@ -258,15 +265,15 @@ static int process(const char *input_path, const char *output_path)
     long start_samples = (long)(p.start_dur_s * sample_rate);
     long stop_samples  = (long)(p.stop_dur_s * sample_rate);
     long silence_samples = (long)(10.0 * sample_rate); /* WMO: 10 sec black after stop */
-    long phasing_samples = (long)(line_samples_d * phasing_lines);
-    long image_samples   = (long)(line_samples_d * img.height);
+    long phasing_samples = line_offset(spl, phasing_lines);
+    long image_samples   = line_offset(spl, img.height);
 
     long total_samples = start_samples + phasing_samples +
                          image_samples + stop_samples + silence_samples;
 
     printf("Parameters: carrier=%.0f Hz, deviation=%.0f Hz, LPM=%d, "
-           "samples/line=%ld, phasing=%d lines\n",
-           carrier_freq, deviation, p.lpm, line_samples,
+           "samples/line=%.2f, phasing=%d lines\n",
+           carrier_freq, deviation, p.lpm, spl,
            phasing_lines);
     printf("Total audio length: %.2f sec (%ld samples)\n",
            (double)total_samples / sample_rate, total_samples);
@@ -283,7 +290,6 @@ static int process(const char *input_path, const char *output_path)
     uint32_t phase = 0;
 
     short *ptr = output;
-    long remaining = total_samples;
 
     /* ====== PHASE 1: APT Start tone (FM-modulated, alternating black/white) ======
      * Standard: carrier modulated by alternate Black and White at start_freq Hz.
@@ -297,7 +303,7 @@ static int process(const char *input_path, const char *output_path)
         printf("Phase 1/4: APT start tone %.0f Hz alternating FM (%.2f sec)\n",
                freq, (double)start_samples / sample_rate);
 
-        for (long i = 0; i < start_samples && remaining > 0; i++) {
+        for (long i = 0; i < start_samples; i++) {
             /* Alternate black/white at the specified frequency */
             uint32_t inc = ((i / half_period_samples) & 1u) ? white_inc : black_inc;
 
@@ -305,35 +311,31 @@ static int process(const char *input_path, const char *output_path)
             ptr[i] = (short)(32767.0 * sin(angle));
             phase += inc;
         }
-        remaining -= start_samples;
         ptr += start_samples;
     }
 
     /* ====== PHASE 2: Phasing lines (sync pattern) ====== */
     {
-        printf("Phase 2/4: Phasing (%d lines, %.1f samples/line)\n",
-               phasing_lines, line_samples_d);
+        printf("Phase 2/4: Phasing (%d lines, %.2f samples/line)\n",
+               phasing_lines, spl);
 
-        for (int pline = 0; pline < phasing_lines && remaining > 0; pline++) {
-            long n = line_samples;
-            if (n > remaining) n = remaining;
+        /* WMO phasing pattern: first 25 ms white, the rest black */
+        long white_samples = (long)(0.025 * sample_rate);
+        if (white_samples < 1) white_samples = 1;
 
-            /* Per-line FM phase increment (black_inc/white_inc already declared above) */
+        for (int pline = 0; pline < phasing_lines; pline++) {
+            long s0 = line_offset(spl, pline);
+            long s1 = line_offset(spl, pline + 1);
 
-            /* WMO phasing pattern: first 25ms = white, remaining = black */
-            long white_samples = (long)(0.025 * sample_rate);
-            if (white_samples < 1) white_samples = 1;
-
-            for (long i = 0; i < n; i++) {
-                uint32_t inc = (i < white_samples) ? white_inc : black_inc;
+            for (long i = s0; i < s1; i++) {
+                uint32_t inc = (i - s0 < white_samples) ? white_inc : black_inc;
 
                 double angle = ((double)(phase & 0xFFFFFFFFu) / 4294967296.0) * 2.0 * M_PI;
-                ptr[pline * line_samples + i] = (short)(32767.0 * sin(angle));
+                ptr[i] = (short)(32767.0 * sin(angle));
 
                 phase += inc;
             }
         }
-        remaining -= phasing_samples;
         ptr += phasing_samples;
     }
 
@@ -341,14 +343,13 @@ static int process(const char *input_path, const char *output_path)
     printf("Phase 3/4: Image data (%d rows, %d cols)\n",
            img.height, img.width);
 
-    /* black_inc/white_inc already declared above */
-
-    for (int row = 0; row < img.height && remaining > 0; row++) {
-        long n = line_samples;
-        if (n > remaining) n = remaining;
+    for (int row = 0; row < img.height; row++) {
+        long s0 = line_offset(spl, row);
+        long s1 = line_offset(spl, row + 1);
+        long n  = s1 - s0;
 
         for (long i = 0; i < n; i++) {
-            int col = (int)((double)i / line_samples_d * img.width);
+            int col = (int)((double)i / (double)n * img.width);
             if (col >= img.width) col = img.width - 1;
 
             uint8_t pixel_val = img.data[row * img.width + col];
@@ -369,12 +370,11 @@ static int process(const char *input_path, const char *output_path)
             uint32_t inc = input_val < 0.5 ? black_inc : white_inc;
 
             double angle = ((double)(phase & 0xFFFFFFFFu) / 4294967296.0) * 2.0 * M_PI;
-            ptr[row * line_samples + i] = (short)(32767.0 * sin(angle));
+            ptr[s0 + i] = (short)(32767.0 * sin(angle));
 
             phase += inc;
         }
     }
-    remaining -= image_samples;
     ptr += image_samples;
 
     /* ====== PHASE 4: APT Stop tone + silence ======
@@ -386,13 +386,12 @@ static int process(const char *input_path, const char *output_path)
         uint32_t half_period_samples = (uint32_t)(sample_rate / (2.0 * freq));
         if (half_period_samples < 1) half_period_samples = 1;
 
-        long silence_samples = (long)(10.0 * sample_rate); /* 10 sec black after stop */
-        long total_phase4    = stop_samples + silence_samples;
+        long total_phase4 = stop_samples + silence_samples;
 
         printf("Phase 4/4: APT stop tone %.0f Hz alternating FM (%.2f sec) + 10s silence\n",
                freq, (double)stop_samples / sample_rate);
 
-        for (long i = 0; i < total_phase4 && remaining > 0; i++) {
+        for (long i = 0; i < total_phase4; i++) {
             if (i < stop_samples) {
                 /* Alternating black/white FM modulation */
                 uint32_t inc = ((i / half_period_samples) & 1u) ? white_inc : black_inc;
