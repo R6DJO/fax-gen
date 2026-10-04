@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <string.h>
 #include <math.h>
 #include <getopt.h>
@@ -64,6 +65,10 @@ static fax_params_t p = {
 
 /* ----- TIFF image loading via libtiff ----- */
 
+/* The RGBA staging buffer needs 4 bytes per pixel; cap the input so the
+ * staging buffer stays at 256 MB and the grayscale buffer at 64 MB. */
+#define MAX_IMAGE_PIXELS (64u * 1024u * 1024u)
+
 typedef struct {
     uint8_t  *data;     /* row-major grayscale, width*height bytes */
     int       width;
@@ -79,77 +84,81 @@ static int load_tiff(const char *path, fax_image_t *img)
     }
 
     uint32_t w = 0, h = 0;
-    TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &w);
-    TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &h);
-    img->width = (int)w;
-    img->height = (int)h;
-
-    if (img->width <= 0 || img->height <= 0) {
-        fprintf(stderr, "Error: invalid image dimensions %dx%d\n",
-                img->width, img->height);
+    if (!TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &w) ||
+        !TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &h) || w == 0 || h == 0) {
+        fprintf(stderr, "Error: missing or zero image dimensions in '%s'\n", path);
         TIFFClose(tif);
         return -1;
     }
 
-    uint16_t spp = 1, bps = 8, photo = PHOTOMETRIC_MINISBLACK;
-    TIFFGetField(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
-    TIFFGetField(tif, TIFFTAG_BITSPERSAMPLE, &bps);
-    if (TIFFGetField(tif, TIFFTAG_PHOTOMETRIC, &photo) == 0) {
-        photo = PHOTOMETRIC_MINISBLACK;
-    }
+    uint16_t spp = 1, bps = 1, photo = PHOTOMETRIC_MINISBLACK, planar = 1;
+    TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_BITSPERSAMPLE, &bps);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_PHOTOMETRIC, &photo);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_PLANARCONFIG, &planar);
 
-    /* Allocate grayscale buffer */
-    img->data = calloc((size_t)img->width * img->height, 1);
-    if (!img->data) {
-        fprintf(stderr, "Error: out of memory for %dx%d\n",
-                img->width, img->height);
+    uint64_t npix = (uint64_t)w * (uint64_t)h;
+    if (npix > MAX_IMAGE_PIXELS) {
+        fprintf(stderr, "Error: image too large (%" PRIu64 " pixels, limit %u)\n",
+                npix, MAX_IMAGE_PIXELS);
         TIFFClose(tif);
         return -1;
     }
 
-    /* Allocate a scanline buffer */
-    size_t row_bytes = (size_t)img->width * spp * bps / 8;
-    if (row_bytes == 0) row_bytes = img->width;
-    uint8_t *rowbuf = malloc(row_bytes);
-    if (!rowbuf) {
-        fprintf(stderr, "Error: out of memory for scanline\n");
-        free(img->data);
+    /*
+     * Decode through libtiff's RGBA image interface rather than raw scanlines.
+     * That interface applies the photometric interpretation and the palette,
+     * and handles 1/2/4/8/16 bits per sample, contig and separated planar
+     * configurations, alpha, YCbCr and tiled images. Doing the same by hand
+     * from scanlines is what previously broke 1-bit bilevel FAX input.
+     */
+    uint32_t *rgba = calloc((size_t)npix, sizeof(uint32_t));
+    if (!rgba) {
+        fprintf(stderr, "Error: out of memory for %ux%u RGBA buffer\n", w, h);
         TIFFClose(tif);
         return -1;
     }
 
-    for (uint32_t y = 0; y < h; y++) {
-        if (TIFFReadScanline(tif, rowbuf, y, 0) < 0) {
-            fprintf(stderr, "Error: failed to read scanline %u\n", y);
-            free(rowbuf);
-            free(img->data);
-            TIFFClose(tif);
-            return -1;
-        }
-
-        for (uint32_t x = 0; x < w; x++) {
-            int val;
-            if (spp == 1) {
-                val = rowbuf[x];
-            } else {
-                /* RGB/RGBA -> grayscale (average of R, G, B) */
-                val = (rowbuf[x * spp] +
-                       rowbuf[x * spp + 1] +
-                       rowbuf[x * spp + 2]) / 3;
-            }
-
-            /* Photometric interpretation: MINISWHITE flips the sense */
-            if (photo == PHOTOMETRIC_MINISWHITE) {
-                val = 255 - val;
-            }
-
-            img->data[y * img->width + x] = (uint8_t)val;
-        }
+    if (!TIFFReadRGBAImageOriented(tif, w, h, rgba, ORIENTATION_TOPLEFT, 1)) {
+        fprintf(stderr, "Error: failed to decode TIFF image '%s'\n", path);
+        free(rgba);
+        TIFFClose(tif);
+        return -1;
     }
-
-    free(rowbuf);
     TIFFClose(tif);
-    printf("Loaded: %s  (%dx%d, grayscale)\n", path, img->width, img->height);
+
+    img->width  = (int)w;
+    img->height = (int)h;
+    img->data   = calloc((size_t)npix, 1);
+    if (!img->data) {
+        fprintf(stderr, "Error: out of memory for %ux%u grayscale buffer\n", w, h);
+        free(rgba);
+        return -1;
+    }
+
+    for (uint64_t i = 0; i < npix; i++) {
+        uint32_t px = rgba[i];
+        int val;
+
+        if (TIFFGetA(px) == 0) {
+            val = 255;   /* fully transparent -> treat as paper (white) */
+        } else {
+            /* Rec. ITU-R BT.601 luma, rounded to 0..255 */
+            val = (int)((0.299 * TIFFGetR(px) +
+                         0.587 * TIFFGetG(px) +
+                         0.114 * TIFFGetB(px)) + 0.5);
+        }
+        if (val < 0) val = 0;
+        if (val > 255) val = 255;
+
+        img->data[i] = (uint8_t)val;
+    }
+
+    free(rgba);
+
+    printf("Loaded: %s  (%dx%d, %u bit/sample, %u sample(s)/px, "
+           "photometric %u, planar %u)\n",
+           path, img->width, img->height, bps, spp, photo, planar);
     return 0;
 }
 
