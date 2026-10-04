@@ -9,7 +9,7 @@
  *
  * Uses FM modulation to encode a TIFF image as an audio signal suitable
  * for transmission/reception via HF radio. Outputs a 16-bit signed,
- * big-endian, mono WAV file at 8000 Hz sample rate.
+ * little-endian, mono WAV file at 8000 Hz sample rate.
  *
  * Usage: tiff2wav <input.tiff> [output.wav]
  *
@@ -155,7 +155,8 @@ static int load_tiff(const char *path, fax_image_t *img)
 
 /* ----- WAV file writer (minimal, no external dependency) -----
  *
- * Writes a RIFF/WAV file with PCM 16-bit signed, big-endian data.
+ * Writes a RIFF/WAV file with PCM 16-bit signed data. The RIFF/WAVE PCM
+ * format is little-endian, so the sample bytes are stored low byte first.
  */
 
 static void put_le32(uint8_t *p, uint32_t v)
@@ -205,12 +206,10 @@ static int write_wav(const char *path, const short *samples, long nsamples)
 
     fwrite(header, 1, 44, fp);
 
-    /* Write audio samples in big-endian order (native is little-endian on x86) */
+    /* Write audio samples in little-endian order (required by RIFF/PCM) */
     for (long i = 0; i < nsamples; i++) {
         uint8_t buf[2];
-        short s = samples[i];
-        buf[0] = (uint8_t)((s >> 8) & 0xFF);
-        buf[1] = (uint8_t)(s & 0xFF);
+        put_le16(buf, (uint16_t)samples[i]);
         fwrite(buf, 1, 2, fp);
     }
 
