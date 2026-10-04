@@ -1,0 +1,13 @@
+# build artifacts
+tiff2wav
+*.o
+
+# generated audio / test output
+*.wav
+
+# local working files (provenance not cleared for redistribution)
+test_weather.tiff
+
+# editors / OS
+*.swp
+.DS_Store
