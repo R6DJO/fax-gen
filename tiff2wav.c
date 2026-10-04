@@ -190,9 +190,15 @@ static int write_wav(const char *path, const short *samples, long nsamples)
         return -1;
     }
 
+    if (nsamples < 0 || (uint64_t)nsamples * 2u + 36u > UINT32_MAX) {
+        fprintf(stderr, "Error: output would exceed the 4 GiB WAV size limit\n");
+        fclose(fp);
+        return -1;
+    }
+
     /* WAV header (44 bytes, RIFF format) */
     uint8_t header[44];
-    uint32_t data_size = (uint32_t)(nsamples * 2);  /* 16-bit = 2 bytes/sample */
+    uint32_t data_size = (uint32_t)((uint64_t)nsamples * 2u);  /* 16-bit = 2 bytes/sample */
 
     /* RIFF header */
     memcpy(header + 0,  "RIFF", 4);
@@ -278,7 +284,14 @@ static int process(const char *input_path, const char *output_path)
     printf("Total audio length: %.2f sec (%ld samples)\n",
            (double)total_samples / sample_rate, total_samples);
 
-    /* Allocate output buffer */
+    /* Allocate output buffer - refuse sizes that cannot be stored in a WAV */
+    if ((uint64_t)total_samples * 2u + 36u > UINT32_MAX) {
+        fprintf(stderr, "Error: output too large (%ld samples, WAV limit is 4 GiB)\n",
+                total_samples);
+        free(img.data);
+        return -1;
+    }
+
     short *output = calloc(1, (size_t)total_samples * sizeof(short));
     if (!output) {
         fprintf(stderr, "Error: out of memory for %ld samples\n", total_samples);
@@ -443,6 +456,83 @@ static void usage(const char *progname)
 
 /* ----- main ----- */
 
+/* Strict option parsing: reject "abc", "12x" and similar, which atof()/atoi()
+ * would silently turn into 0. */
+static double opt_double(const char *arg, const char *name)
+{
+    char *end = NULL;
+    double v = strtod(arg, &end);
+    if (end == arg || (end != NULL && *end != '\0')) {
+        fprintf(stderr, "Error: %s expects a number, got '%s'\n", name, arg);
+        exit(1);
+    }
+    return v;
+}
+
+static long opt_long(const char *arg, const char *name)
+{
+    char *end = NULL;
+    long v = strtol(arg, &end, 10);
+    if (end == arg || (end != NULL && *end != '\0')) {
+        fprintf(stderr, "Error: %s expects an integer, got '%s'\n", name, arg);
+        exit(1);
+    }
+    return v;
+}
+
+/* Reject parameter combinations that would produce a meaningless signal. */
+static int validate_params(void)
+{
+    double nyquist = (double)p.sample_rate / 2.0;
+
+    if (p.lpm <= 0) {
+        fprintf(stderr, "Error: --lpm must be > 0\n");
+        return -1;
+    }
+    if (60.0 * (double)p.sample_rate / (double)p.lpm < 1.0) {
+        fprintf(stderr, "Error: --lpm too high for %d Hz sample rate\n", p.sample_rate);
+        return -1;
+    }
+    if (p.phasing_lines < 0) {
+        fprintf(stderr, "Error: --phasing must be >= 0\n");
+        return -1;
+    }
+    if (p.start_dur_s < 0 || p.stop_dur_s < 0) {
+        fprintf(stderr, "Error: start/stop tone duration must be >= 0\n");
+        return -1;
+    }
+    if (p.carrier_freq <= 0.0) {
+        fprintf(stderr, "Error: --carrier must be > 0\n");
+        return -1;
+    }
+    if (p.deviation < 0.0) {
+        fprintf(stderr, "Error: --deviation must be >= 0\n");
+        return -1;
+    }
+    if (p.carrier_freq - p.deviation < 1.0) {
+        fprintf(stderr, "Error: carrier - deviation must stay above 1 Hz\n");
+        return -1;
+    }
+    if (p.carrier_freq + p.deviation >= nyquist) {
+        fprintf(stderr, "Error: carrier + deviation must stay below Nyquist (%.0f Hz)\n",
+                nyquist);
+        return -1;
+    }
+    if (p.start_freq <= 0.0 || p.start_freq >= nyquist) {
+        fprintf(stderr, "Error: --start tone frequency must be in (0, %.0f) Hz\n", nyquist);
+        return -1;
+    }
+    if (p.stop_freq <= 0.0 || p.stop_freq >= nyquist) {
+        fprintf(stderr, "Error: --stop tone frequency must be in (0, %.0f) Hz\n", nyquist);
+        return -1;
+    }
+    if (p.threshold < 0.0 || p.threshold > 255.0) {
+        fprintf(stderr, "Error: --threshold must be in 0..255\n");
+        return -1;
+    }
+    return 0;
+}
+
 int main(int argc, char *argv[])
 {
     const char *input_path = NULL;
@@ -464,13 +554,13 @@ int main(int argc, char *argv[])
     int opt;
     while ((opt = getopt_long(argc, argv, "c:d:l:p:s:S:t:ih", long_opts, NULL)) != -1) {
         switch (opt) {
-        case 'c': p.carrier_freq = atof(optarg); break;
-        case 'd': p.deviation  = atof(optarg);  break;
-        case 'l': p.lpm        = atoi(optarg);  break;
-        case 'p': p.phasing_lines = atoi(optarg); break;
-        case 's': p.start_freq = atof(optarg); break;
-        case 'S': p.stop_freq  = atof(optarg); break;
-        case 't': p.threshold  = (double)atoi(optarg); break;
+        case 'c': p.carrier_freq    = opt_double(optarg, "--carrier");   break;
+        case 'd': p.deviation       = opt_double(optarg, "--deviation"); break;
+        case 'l': p.lpm             = (int)opt_long(optarg, "--lpm");    break;
+        case 'p': p.phasing_lines   = (int)opt_long(optarg, "--phasing"); break;
+        case 's': p.start_freq      = opt_double(optarg, "--start");     break;
+        case 'S': p.stop_freq       = opt_double(optarg, "--stop");      break;
+        case 't': p.threshold       = opt_double(optarg, "--threshold"); break;
         case 'i': p.invert_image = 1;            break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 1;
@@ -486,6 +576,10 @@ int main(int argc, char *argv[])
     input_path = argv[optind];
     if (optind + 1 < argc) {
         output_path = argv[optind + 1];
+    }
+
+    if (validate_params() < 0) {
+        return 1;
     }
 
     printf("tiff2wav - TIFF to WAV converter for amateur radio FAX\n");
