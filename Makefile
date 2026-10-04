@@ -11,9 +11,15 @@ SRCS    = tiff2wav.c
 
 # 200 image rows @ 120 lpm / 8 kHz = 4000 samples per row, plus
 # 5 s start tone + 60 phasing lines + 5 s stop tone + 10 s black silence
-TEST_CARDS = tests/test_card.tiff tests/test_card_1bit.tiff
+TEST_CARD  = tests/test_card.tiff
+TEST_CARDS = $(TEST_CARD) tests/test_card_1bit.tiff
 TEST_BYTES = 2400044
-TEST_OUTS  = test_card_output.wav test_card_1bit_output.wav
+TEST_OUTS  = test_card_output.wav test_card_1bit_output.wav preset_output.wav
+
+# --hamfax: 5 s start + (20 phasing lines + 1 all-white end line) + 200 rows
+#           + 5 s stop, no trailing silence
+PRESET_OUT  = preset_output.wav
+PRESET_BYTES = 1928044
 
 all: $(TARGET)
 
@@ -40,6 +46,12 @@ test: $(TARGET)
 		fi; \
 		echo "test: OK $$out ($$size bytes, RIFF PCM mono 8000 Hz 16 bit)"; \
 	done
+	@./$(TARGET) --hamfax $(TEST_CARD) $(PRESET_OUT) > /dev/null
+	@size=`wc -c < $(PRESET_OUT)`; \
+	if [ "$$size" != "$(PRESET_BYTES)" ]; then \
+		echo "test: FAIL $(PRESET_OUT) (size=$$size, expected $(PRESET_BYTES))"; exit 1; \
+	fi; \
+	echo "test: OK $(PRESET_OUT) ($$size bytes, --hamfax preset)"
 
 clean:
 	rm -f $(TARGET) *.o $(TEST_OUTS)

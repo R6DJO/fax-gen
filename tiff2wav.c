@@ -17,6 +17,9 @@
  *   carrier = 1900 Hz, deviation = ±400 Hz, LPM = 120, IOC = 576,
  *   phasing = 60 lines (WMO), APT start=300 Hz / 5s alternating FM,
  *   stop=450 Hz / 5s alternating FM + 10s black silence.
+ *
+ * --hamfax switches to the hamfax phasing preset: 20 lines, white at both
+ * ends of each line, one extra all-white end line, no trailing silence.
  */
 
 #define _USE_MATH_DEFINES
@@ -33,7 +36,14 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ----- configurable parameters (defaults match hamfax) ----- */
+/* ----- configurable parameters -----
+ *
+ * The defaults (1900 Hz carrier, +/-400 Hz deviation, 120 lines/min, 300 Hz
+ * start tone and 450 Hz stop tone, 5 s each) are also the defaults of hamfax,
+ * a GPL-2.0-or-later project used as the starting reference - see the README.
+ * The phasing pattern below is the WMO/APT one; the hamfax pattern is
+ * available through --hamfax.
+ */
 
 typedef struct {
     int       sample_rate;        /* 8000 Hz */
@@ -41,10 +51,13 @@ typedef struct {
     double    deviation;          /* 400 Hz */
     int       lpm;                /* lines per minute = 120 */
     int       phasing_lines;      /* 60 phasing lines (WMO standard) */
+    int       phasing_pattern;    /* 0 = WMO, 1 = hamfax (see PHASE 2) */
+    int       end_phasing_line;   /* 1 = one extra all-white line after phasing */
     double    start_freq;         /* APT start tone, 300 Hz */
     int       start_dur_s;        /* 5 seconds */
     double    stop_freq;          /* APT stop tone, 450 Hz */
     int       stop_dur_s;         /* 5 seconds */
+    int       silence_s;          /* seconds of black level after the stop tone */
     double    threshold;          /* binary threshold for grayscale (0-255) */
     int       invert_image;       /* invert image before modulation */
 } fax_params_t;
@@ -55,10 +68,13 @@ static fax_params_t p = {
     .deviation       = 400.0,
     .lpm             = 120,
     .phasing_lines   = 60,
+    .phasing_pattern = 0,
+    .end_phasing_line = 0,
     .start_freq      = 300.0,
     .start_dur_s     = 5,
     .stop_freq       = 450.0,
     .stop_dur_s      = 5,
+    .silence_s       = 10,
     .threshold       = 128,
     .invert_image    = 0
 };
@@ -266,21 +282,23 @@ static int process(const char *input_path, const char *output_path)
     uint32_t white_inc   = (uint32_t)((carrier_freq + deviation) * 4294967296.0 / sample_rate);
 
     /* Calculate total number of samples needed:
-     *   start tone + phasing lines + image rows + stop tone + 10s black silence
+     *   start tone + phasing lines (+ optional all-white end line)
+     *   + image rows + stop tone + optional black silence
      */
     long start_samples = (long)(p.start_dur_s * sample_rate);
     long stop_samples  = (long)(p.stop_dur_s * sample_rate);
-    long silence_samples = (long)(10.0 * sample_rate); /* WMO: 10 sec black after stop */
-    long phasing_samples = line_offset(spl, phasing_lines);
+    long silence_samples = (long)(p.silence_s * sample_rate);
+    long phasing_total = phasing_lines + (p.end_phasing_line ? 1 : 0);
+    long phasing_samples = line_offset(spl, phasing_total);
     long image_samples   = line_offset(spl, img.height);
 
     long total_samples = start_samples + phasing_samples +
                          image_samples + stop_samples + silence_samples;
 
     printf("Parameters: carrier=%.0f Hz, deviation=%.0f Hz, LPM=%d, "
-           "samples/line=%.2f, phasing=%d lines\n",
-           carrier_freq, deviation, p.lpm, spl,
-           phasing_lines);
+           "samples/line=%.2f, phasing=%d lines%s, silence=%d s\n",
+           carrier_freq, deviation, p.lpm, spl, phasing_lines,
+           p.end_phasing_line ? " + end line" : "", p.silence_s);
     printf("Total audio length: %.2f sec (%ld samples)\n",
            (double)total_samples / sample_rate, total_samples);
 
@@ -329,19 +347,34 @@ static int process(const char *input_path, const char *output_path)
 
     /* ====== PHASE 2: Phasing lines (sync pattern) ====== */
     {
-        printf("Phase 2/4: Phasing (%d lines, %.2f samples/line)\n",
-               phasing_lines, spl);
+        printf("Phase 2/4: Phasing (%d lines%s, %.2f samples/line, pattern %s)\n",
+               phasing_lines, p.end_phasing_line ? " + end line" : "", spl,
+               p.phasing_pattern ? "hamfax" : "WMO");
 
-        /* WMO phasing pattern: first 25 ms white, the rest black */
+        /* WMO: the first 25 ms of every line is white, the rest black.
+         * hamfax: white while the position inside the line is < 2.5 % or
+         * >= 97.5 % (2.5 % at both ends), plus one extra all-white line. */
         long white_samples = (long)(0.025 * sample_rate);
         if (white_samples < 1) white_samples = 1;
 
-        for (int pline = 0; pline < phasing_lines; pline++) {
+        for (long pline = 0; pline < phasing_total; pline++) {
             long s0 = line_offset(spl, pline);
             long s1 = line_offset(spl, pline + 1);
+            long n  = s1 - s0;
+            int is_end_line = p.end_phasing_line && (pline == phasing_lines);
 
             for (long i = s0; i < s1; i++) {
-                uint32_t inc = (i - s0 < white_samples) ? white_inc : black_inc;
+                int level_white;
+                if (is_end_line) {
+                    level_white = 1;
+                } else if (p.phasing_pattern) {
+                    double pos = (double)(i - s0) / (double)n;
+                    level_white = (pos < 0.025 || pos >= 0.975);
+                } else {
+                    level_white = (i - s0 < white_samples);
+                }
+
+                uint32_t inc = level_white ? white_inc : black_inc;
 
                 double angle = ((double)(phase & 0xFFFFFFFFu) / 4294967296.0) * 2.0 * M_PI;
                 ptr[i] = (short)(32767.0 * sin(angle));
@@ -390,9 +423,10 @@ static int process(const char *input_path, const char *output_path)
     }
     ptr += image_samples;
 
-    /* ====== PHASE 4: APT Stop tone + silence ======
-     * Standard: carrier modulated by alternate Black and White at stop_freq Hz for 5s,
-     * followed by 10 seconds of black level (carrier - deviation).
+    /* ====== PHASE 4: APT Stop tone + black silence ======
+     * Standard: carrier modulated by alternate Black and White at stop_freq Hz,
+     * followed by silence_s seconds of black level (carrier - deviation).
+     * hamfax emits no silence, so --hamfax sets silence_s to 0.
      */
     {
         double freq = p.stop_freq;
@@ -401,8 +435,8 @@ static int process(const char *input_path, const char *output_path)
 
         long total_phase4 = stop_samples + silence_samples;
 
-        printf("Phase 4/4: APT stop tone %.0f Hz alternating FM (%.2f sec) + 10s silence\n",
-               freq, (double)stop_samples / sample_rate);
+        printf("Phase 4/4: APT stop tone %.0f Hz alternating FM (%.2f sec) + %d s silence\n",
+               freq, (double)stop_samples / sample_rate, p.silence_s);
 
         for (long i = 0; i < total_phase4; i++) {
             if (i < stop_samples) {
@@ -412,7 +446,7 @@ static int process(const char *input_path, const char *output_path)
                 ptr[i] = (short)(32767.0 * sin(angle));
                 phase += inc;
             } else {
-                /* 10 seconds of black level (carrier - deviation) */
+                /* black level (carrier - deviation) */
                 double angle = ((double)(phase & 0xFFFFFFFFu) / 4294967296.0) * 2.0 * M_PI;
                 ptr[i] = (short)(32767.0 * sin(angle));
                 phase += black_inc;
@@ -427,6 +461,27 @@ static int process(const char *input_path, const char *output_path)
     free(img.data);
 
     return (rc == 0) ? 0 : -1;
+}
+
+/* ----- hamfax preset ----- */
+
+/*
+ * Reproduce the phasing behaviour of hamfax (hamfax/src/FaxTransmitter.cpp
+ * plus its Config.cpp defaults): 20 phasing lines, white while the position
+ * inside the line is < 2.5 % or >= 97.5 %, one extra all-white line after
+ * them, and no trailing black silence. Carrier, deviation, LPM and the APT
+ * start/stop tones already match, so they are left alone.
+ *
+ * hamfax is GPL-2.0-or-later, (C) 2001, 2011 Christof Schmitt, DH1CS. None of
+ * its code is copied here - only its published behaviour is imitated. See the
+ * README for the attribution.
+ */
+static void apply_hamfax_preset(void)
+{
+    p.phasing_lines    = 20;
+    p.phasing_pattern  = 1;
+    p.end_phasing_line = 1;
+    p.silence_s        = 0;
 }
 
 /* ----- Usage/help ----- */
@@ -446,6 +501,9 @@ static void usage(const char *progname)
         "  -S, --stop FREQ        APT stop tone freq  (default: %g)\n"
         "  -t, --threshold N      Binary threshold 0-255 (default: %d)\n"
         "  -i, --invert           Invert image polarity\n"
+        "  -H, --hamfax           hamfax phasing preset: 20 lines, white at both\n"
+        "                         ends of each line, extra all-white end line,\n"
+        "                         no trailing silence\n"
         "  -h, --help             Show this help\n",
         progname,
         p.carrier_freq, p.deviation,
@@ -501,6 +559,10 @@ static int validate_params(void)
         fprintf(stderr, "Error: start/stop tone duration must be >= 0\n");
         return -1;
     }
+    if (p.silence_s < 0) {
+        fprintf(stderr, "Error: trailing silence must be >= 0 s\n");
+        return -1;
+    }
     if (p.carrier_freq <= 0.0) {
         fprintf(stderr, "Error: --carrier must be > 0\n");
         return -1;
@@ -547,12 +609,13 @@ int main(int argc, char *argv[])
         {"stop",      required_argument, 0, 'S'},
         {"threshold", required_argument, 0, 't'},
         {"invert",    no_argument,       0, 'i'},
+        {"hamfax",    no_argument,       0, 'H'},
         {"help",      no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "c:d:l:p:s:S:t:ih", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "c:d:l:p:s:S:t:iHh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'c': p.carrier_freq    = opt_double(optarg, "--carrier");   break;
         case 'd': p.deviation       = opt_double(optarg, "--deviation"); break;
@@ -562,6 +625,7 @@ int main(int argc, char *argv[])
         case 'S': p.stop_freq       = opt_double(optarg, "--stop");      break;
         case 't': p.threshold       = opt_double(optarg, "--threshold"); break;
         case 'i': p.invert_image = 1;            break;
+        case 'H': apply_hamfax_preset();         break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 1;
         }
